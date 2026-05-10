@@ -1,0 +1,32 @@
+services:
+  deepseek-px:
+    build: .
+    container_name: deepseek-px
+    ports:
+      - "8000:8000"
+    environment:
+      DEFAULT_BASE_URL: "https://api.deepseek.com"
+
+      # replay: 正常调用链，缓存并回填真实 reasoning_content
+      # fake: 缓存找不到时直接填占位 reasoning_content
+      # disable_thinking: 直接禁用 thinking
+      # off: 只做代理转发和兼容清理
+      PATCH_MODE: "replay"
+      REPLAY_MISS_FALLBACK: "none"
+      FAKE_REASONING_CONTENT: "done"
+
+      # DeepSeek 兼容性修复
+      NORMALIZE_DEVELOPER_ROLE: "true"
+      NORMALIZE_CONTENT_BLOCKS: "true"
+      STRIP_UNSUPPORTED_PARAMS: "true"
+
+      # 可选：强制改模型名；不需要就留空
+      FORCE_MODEL: ""
+
+      CACHE_DB_PATH: "/data/reasoning_cache.sqlite3"
+      CACHE_TTL_SECONDS: "86400"
+      ALLOWED_BASE_HOSTS: "api.deepseek.com"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
