@@ -25,7 +25,7 @@ DEFAULT_BASE_URL = os.getenv("DEFAULT_BASE_URL", "https://api.deepseek.com").rst
 #   replay           正常调用链：缓存 DeepSeek 真实 reasoning_content，下一轮缺失时回填
 #   fake             给 assistant + tool_calls 自动补一个占位 reasoning_content
 #   disable_thinking 直接在请求体设置 thinking.type=disabled
-#   off              不处理 reasoning_content，只做普通转发和兼容性清理
+#   off              不处理 reasoning_content，只做普通转发
 PATCH_MODE = os.getenv("PATCH_MODE", "replay").lower()
 
 # replay 模式找不到缓存时的兜底策略：
@@ -35,15 +35,22 @@ PATCH_MODE = os.getenv("PATCH_MODE", "replay").lower()
 REPLAY_MISS_FALLBACK = os.getenv("REPLAY_MISS_FALLBACK", "none").lower()
 FAKE_REASONING_CONTENT = os.getenv("FAKE_REASONING_CONTENT", "done")
 
-# 是否把 DeepSeek 不支持的 developer role 转成 system。
-NORMALIZE_DEVELOPER_ROLE = os.getenv("NORMALIZE_DEVELOPER_ROLE", "true").lower() in {"1", "true", "yes", "on"}
-
-# 是否把 OpenAI/Claude 风格 content blocks 转成普通字符串。
-# 例如 [{"type":"text","text":"hello"}] -> "hello"
-NORMALIZE_CONTENT_BLOCKS = os.getenv("NORMALIZE_CONTENT_BLOCKS", "true").lower() in {"1", "true", "yes", "on"}
-
-# 是否清理 DeepSeek 不支持或容易出错的 OpenAI 扩展字段。
-STRIP_UNSUPPORTED_PARAMS = os.getenv("STRIP_UNSUPPORTED_PARAMS", "true").lower() in {"1", "true", "yes", "on"}
+# 修复 OpenAI tool_calls 调用链：
+#   prune      默认，删除不完整的 assistant tool_calls 消息，以及它后面残留的 tool 消息
+#   synthesize 给缺失的 tool_call_id 自动补一个 synthetic tool 消息
+#   error      发现不完整调用链就返回 422，便于调试
+#   off        不修复工具调用链
+TOOL_CHAIN_FIX_MODE = os.getenv("TOOL_CHAIN_FIX_MODE", "prune").lower()
+SYNTHETIC_TOOL_CONTENT = os.getenv(
+    "SYNTHETIC_TOOL_CONTENT",
+    '{"ok":true,"note":"synthetic tool result inserted by proxy because original tool response was missing"}',
+)
+DROP_ORPHAN_TOOL_MESSAGES = os.getenv("DROP_ORPHAN_TOOL_MESSAGES", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # SQLite 缓存位置。docker-compose 默认挂载到 /data。
 CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "/data/reasoning_cache.sqlite3")
@@ -69,23 +76,6 @@ HOP_BY_HOP_HEADERS = {
 # 为了能解析上游 JSON/SSE，尽量要求上游不要压缩。
 DROP_REQUEST_HEADERS = {"x-px-base-url", "accept-encoding"}
 
-# DeepSeek /chat/completions 不需要或可能不接受的 OpenAI 扩展字段。
-UNSUPPORTED_TOP_LEVEL_FIELDS = {
-    "store",
-    "metadata",
-    "parallel_tool_calls",
-    "service_tier",
-    "prediction",
-    "modalities",
-    "audio",
-    "web_search_options",
-    "response_format",  # 如果你需要 JSON mode，可把它从这里删掉
-}
-
-# 某些客户端会把非 DeepSeek 的模型名传进来。
-# 默认不强行改；如果设置 FORCE_MODEL，就覆盖 payload["model"]。
-FORCE_MODEL = os.getenv("FORCE_MODEL", "").strip()
-
 
 class ReasoningStore:
     def __init__(self, db_path: str):
@@ -110,7 +100,8 @@ class ReasoningStore:
                 """
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_reasoning_cache_created_at ON reasoning_cache(created_at)"
+                "CREATE INDEX IF NOT EXISTS idx_reasoning_cache_created_at "
+                "ON reasoning_cache(created_at)"
             )
 
     def put_many(self, keys: list[str], reasoning_content: str, source: str) -> int:
@@ -161,13 +152,18 @@ class ReasoningStore:
         expire_before = int(time.time()) - CACHE_TTL_SECONDS
         with self._lock:
             with self._connect() as conn:
-                cur = conn.execute("DELETE FROM reasoning_cache WHERE created_at < ?", (expire_before,))
+                cur = conn.execute(
+                    "DELETE FROM reasoning_cache WHERE created_at < ?",
+                    (expire_before,),
+                )
                 return cur.rowcount
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
             with self._connect() as conn:
-                row = conn.execute("SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM reasoning_cache").fetchone()
+                row = conn.execute(
+                    "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM reasoning_cache"
+                ).fetchone()
         return {
             "count": row[0] if row else 0,
             "oldest_created_at": row[1] if row else None,
@@ -210,7 +206,11 @@ def normalize_tool_call(tool_call: dict[str, Any], include_id: bool = True) -> d
 def normalize_tool_calls(tool_calls: Any, include_id: bool = True) -> list[dict[str, Any]]:
     if not isinstance(tool_calls, list):
         return []
-    return [normalize_tool_call(tc, include_id=include_id) for tc in tool_calls if isinstance(tc, dict)]
+    return [
+        normalize_tool_call(tc, include_id=include_id)
+        for tc in tool_calls
+        if isinstance(tc, dict)
+    ]
 
 
 def build_reasoning_keys_from_message(message: dict[str, Any]) -> list[str]:
@@ -238,37 +238,33 @@ def build_reasoning_keys_from_message(message: dict[str, Any]) -> list[str]:
             name = function.get("name", "")
             arguments = function.get("arguments", "")
             if name or arguments:
-                keys.append(f"function_sha256:{sha256_text(stable_json({'name': name, 'arguments': arguments}))}")
+                keys.append(
+                    f"function_sha256:{sha256_text(stable_json({'name': name, 'arguments': arguments}))}"
+                )
 
     if normalized_with_id:
         keys.append(f"tool_calls_sha256:{sha256_text(stable_json(normalized_with_id))}")
 
     if normalized_without_id:
-        keys.append(f"tool_calls_no_id_sha256:{sha256_text(stable_json(normalized_without_id))}")
+        keys.append(
+            f"tool_calls_no_id_sha256:{sha256_text(stable_json(normalized_without_id))}"
+        )
 
     message_signature = {
         "role": message.get("role"),
-        "content": normalize_content_for_signature(message.get("content", "")),
+        "content": message.get("content", ""),
         "tool_calls": normalized_with_id,
     }
     keys.append(f"message_sha256:{sha256_text(stable_json(message_signature))}")
 
     message_signature_no_id = {
         "role": message.get("role"),
-        "content": normalize_content_for_signature(message.get("content", "")),
+        "content": message.get("content", ""),
         "tool_calls": normalized_without_id,
     }
     keys.append(f"message_no_id_sha256:{sha256_text(stable_json(message_signature_no_id))}")
 
     return list(dict.fromkeys(keys))
-
-
-def normalize_content_for_signature(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if content is None:
-        return ""
-    return stable_json(content)
 
 
 def is_assistant_tool_call_message(message: Any) -> bool:
@@ -278,6 +274,153 @@ def is_assistant_tool_call_message(message: Any) -> bool:
         and isinstance(message.get("tool_calls"), list)
         and len(message.get("tool_calls")) > 0
     )
+
+
+def is_tool_message(message: Any) -> bool:
+    return isinstance(message, dict) and message.get("role") == "tool"
+
+
+def ensure_tool_call_ids(message: dict[str, Any]) -> tuple[list[str], int]:
+    """
+    OpenAI 工具调用链要求每个 tool_call 有 id，后续 tool 消息用 tool_call_id 对应。
+    有些客户端中转时可能丢 id，这里补一个稳定 id，避免上游直接拒绝。
+    """
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return [], 0
+
+    ids: list[str] = []
+    changed = 0
+    used: set[str] = set()
+
+    for index, tool_call in enumerate(tool_calls):
+        if not isinstance(tool_call, dict):
+            continue
+
+        tc_id = tool_call.get("id")
+        if not isinstance(tc_id, str) or not tc_id:
+            signature = {
+                "index": index,
+                "type": tool_call.get("type", "function"),
+                "function": tool_call.get("function", {}),
+            }
+            tc_id = "call_px_" + sha256_text(stable_json(signature))[:24]
+            tool_call["id"] = tc_id
+            changed += 1
+
+        # 防止同一条 assistant 消息里出现重复 id。
+        if tc_id in used:
+            tc_id = f"{tc_id}_{index}"
+            tool_call["id"] = tc_id
+            changed += 1
+
+        used.add(tc_id)
+        ids.append(tc_id)
+
+    return ids, changed
+
+
+def repair_tool_call_chain(messages: list[Any]) -> tuple[list[Any], int, list[str]]:
+    """
+    修复 DeepSeek/OpenAI 严格校验的 tool_calls 消息链。
+
+    合法格式必须是：
+      assistant(tool_calls=[id1,id2])
+      tool(tool_call_id=id1)
+      tool(tool_call_id=id2)
+
+    如果 assistant 后面没有紧跟对应 tool 消息，就会出现：
+      An assistant message with 'tool_calls' must be followed by tool messages...
+    """
+    if TOOL_CHAIN_FIX_MODE == "off":
+        return messages, 0, []
+
+    fixed_count = 0
+    errors: list[str] = []
+    repaired: list[Any] = []
+    i = 0
+
+    while i < len(messages):
+        message = messages[i]
+
+        if is_assistant_tool_call_message(message):
+            tool_call_ids, id_fixed = ensure_tool_call_ids(message)
+            fixed_count += id_fixed
+
+            j = i + 1
+            following_tools: list[dict[str, Any]] = []
+            while j < len(messages) and is_tool_message(messages[j]):
+                following_tools.append(messages[j])
+                j += 1
+
+            seen: set[str] = set()
+            valid_tools: list[dict[str, Any]] = []
+            required_ids = set(tool_call_ids)
+
+            for tool_message in following_tools:
+                tool_call_id = tool_message.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id in required_ids and tool_call_id not in seen:
+                    valid_tools.append(tool_message)
+                    seen.add(tool_call_id)
+                else:
+                    if DROP_ORPHAN_TOOL_MESSAGES:
+                        fixed_count += 1
+                    else:
+                        valid_tools.append(tool_message)
+
+            missing_ids = [tc_id for tc_id in tool_call_ids if tc_id not in seen]
+
+            if missing_ids:
+                message_text = (
+                    f"messages[{i}] assistant tool_calls missing tool responses: "
+                    f"{', '.join(missing_ids)}"
+                )
+
+                if TOOL_CHAIN_FIX_MODE == "error":
+                    errors.append(message_text)
+                    repaired.append(message)
+                    repaired.extend(following_tools)
+                elif TOOL_CHAIN_FIX_MODE == "synthesize":
+                    repaired.append(message)
+                    repaired.extend(valid_tools)
+                    for missing_id in missing_ids:
+                        repaired.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": missing_id,
+                                "content": SYNTHETIC_TOOL_CONTENT,
+                            }
+                        )
+                    fixed_count += len(missing_ids)
+                    logger.warning("%s; inserted synthetic tool messages", message_text)
+                else:
+                    # 默认 prune：删掉这条不完整的 assistant tool_calls，以及后面残留的 tool。
+                    # 这样比伪造真实工具结果更安全，模型会基于剩余上下文重新决策。
+                    fixed_count += 1 + len(following_tools)
+                    logger.warning("%s; pruned invalid assistant/tool chain", message_text)
+
+                i = j
+                continue
+
+            repaired.append(message)
+            repaired.extend(valid_tools)
+            i = j
+            continue
+
+        if is_tool_message(message):
+            # 没有紧跟在 assistant tool_calls 后面的 tool 消息属于孤儿消息，很多上游也会拒绝。
+            if DROP_ORPHAN_TOOL_MESSAGES:
+                fixed_count += 1
+                logger.warning("pruned orphan tool message at messages[%s]", i)
+            else:
+                repaired.append(message)
+            i += 1
+            continue
+
+        repaired.append(message)
+        i += 1
+
+    return repaired, fixed_count, errors
 
 
 def store_assistant_message(message: dict[str, Any], source: str) -> int:
@@ -290,7 +433,12 @@ def store_assistant_message(message: dict[str, Any], source: str) -> int:
 
     keys = build_reasoning_keys_from_message(message)
     count = store.put_many(keys, reasoning, source=source)
-    logger.info("stored reasoning_content source=%s keys=%s reasoning_chars=%s", source, count, len(reasoning))
+    logger.info(
+        "stored reasoning_content source=%s keys=%s reasoning_chars=%s",
+        source,
+        count,
+        len(reasoning),
+    )
     return count
 
 
@@ -309,154 +457,20 @@ def store_from_response_payload(payload: dict[str, Any], source: str) -> int:
     return stored
 
 
-def content_blocks_to_string(content: Any) -> Any:
-    """
-    兼容 Claude/OpenAI content block：
-      [{"type":"text","text":"hello"}] -> "hello"
-
-    非纯文本块会尽量保留可读内容；图片、复杂结构转成 JSON 字符串。
-    """
-    if not isinstance(content, list):
-        return content
-
-    parts: list[str] = []
-
-    for item in content:
-        if isinstance(item, str):
-            parts.append(item)
-            continue
-
-        if not isinstance(item, dict):
-            parts.append(stable_json(item))
-            continue
-
-        item_type = item.get("type")
-
-        if item_type == "text" and isinstance(item.get("text"), str):
-            parts.append(item["text"])
-        elif isinstance(item.get("text"), str):
-            parts.append(item["text"])
-        elif isinstance(item.get("content"), str):
-            parts.append(item["content"])
-        else:
-            parts.append(stable_json(item))
-
-    return "\n".join(part for part in parts if part is not None)
-
-
-def normalize_deepseek_messages(payload: dict[str, Any]) -> tuple[int, int]:
-    """
-    修 DeepSeek 兼容性：
-    1. developer role -> system role
-    2. content block array -> string
-    """
-    role_changed = 0
-    content_changed = 0
-
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return role_changed, content_changed
-
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-
-        if NORMALIZE_DEVELOPER_ROLE and message.get("role") == "developer":
-            message["role"] = "system"
-            role_changed += 1
-
-        if NORMALIZE_CONTENT_BLOCKS and "content" in message:
-            old_content = message.get("content")
-            new_content = content_blocks_to_string(old_content)
-            if new_content is not old_content and new_content != old_content:
-                message["content"] = new_content
-                content_changed += 1
-
-    return role_changed, content_changed
-
-
-def strip_unsupported_payload_fields(payload: dict[str, Any]) -> list[str]:
-    removed: list[str] = []
-
-    if not STRIP_UNSUPPORTED_PARAMS:
-        return removed
-
-    for key in list(UNSUPPORTED_TOP_LEVEL_FIELDS):
-        if key in payload:
-            payload.pop(key, None)
-            removed.append(key)
-
-    return sorted(removed)
-
-
-def normalize_tools(payload: dict[str, Any]) -> int:
-    """
-    DeepSeek 支持 OpenAI 风格 tools。
-    这里只做轻量清理，避免某些客户端塞入多余字段导致 400。
-    """
-    tools = payload.get("tools")
-    if not isinstance(tools, list):
-        return 0
-
-    changed = 0
-
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if tool.get("type") != "function":
-            continue
-
-        function = tool.get("function")
-        if not isinstance(function, dict):
-            continue
-
-        # 有些客户端可能带入非标准 display/metadata 字段，DeepSeek 不一定接受。
-        allowed_function_keys = {"name", "description", "parameters", "strict"}
-        for key in list(function.keys()):
-            if key not in allowed_function_keys:
-                function.pop(key, None)
-                changed += 1
-
-    return changed
-
-
-def normalize_payload_for_deepseek(payload: dict[str, Any]) -> dict[str, Any]:
-    if FORCE_MODEL:
-        payload["model"] = FORCE_MODEL
-
-    role_changed, content_changed = normalize_deepseek_messages(payload)
-    removed_fields = strip_unsupported_payload_fields(payload)
-    tool_changed = normalize_tools(payload)
-
-    if role_changed or content_changed or removed_fields or tool_changed:
-        logger.info(
-            "normalized payload: developer_to_system=%s content_blocks=%s removed_fields=%s tool_fields=%s",
-            role_changed,
-            content_changed,
-            removed_fields,
-            tool_changed,
-        )
-
-    return payload
-
-
-def repair_request_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], int, list[int]]:
+def repair_reasoning_content(payload: dict[str, Any]) -> tuple[int, list[int]]:
     patched_count = 0
     missing_indexes: list[int] = []
 
-    # 先做 DeepSeek 兼容性清理，再做 reasoning replay。
-    payload = normalize_payload_for_deepseek(payload)
-
     if PATCH_MODE == "off":
-        return payload, patched_count, missing_indexes
+        return patched_count, missing_indexes
 
     if PATCH_MODE == "disable_thinking":
         payload["thinking"] = {"type": "disabled"}
-        return payload, patched_count, missing_indexes
+        return patched_count, missing_indexes
 
     messages = payload.get("messages")
     if not isinstance(messages, list):
-        return payload, patched_count, missing_indexes
+        return patched_count, missing_indexes
 
     if PATCH_MODE == "fake":
         for index, message in enumerate(messages):
@@ -466,11 +480,11 @@ def repair_request_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], int
             if current is None or current == "":
                 message["reasoning_content"] = FAKE_REASONING_CONTENT
                 patched_count += 1
-        return payload, patched_count, missing_indexes
+        return patched_count, missing_indexes
 
     if PATCH_MODE != "replay":
-        logger.warning("Unknown PATCH_MODE=%s, skip patching.", PATCH_MODE)
-        return payload, patched_count, missing_indexes
+        logger.warning("Unknown PATCH_MODE=%s, skip reasoning patching.", PATCH_MODE)
+        return patched_count, missing_indexes
 
     for index, message in enumerate(messages):
         if not is_assistant_tool_call_message(message):
@@ -486,7 +500,12 @@ def repair_request_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], int
         if restored:
             message["reasoning_content"] = restored
             patched_count += 1
-            logger.info("restored reasoning_content for messages[%s] by key=%s chars=%s", index, matched_key, len(restored))
+            logger.info(
+                "restored reasoning_content for messages[%s] by key=%s chars=%s",
+                index,
+                matched_key,
+                len(restored),
+            )
         else:
             missing_indexes.append(index)
             logger.warning("missing reasoning_content cache for messages[%s]", index)
@@ -498,21 +517,40 @@ def repair_request_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], int
                 # 由调用方返回 422
                 pass
 
-    return payload, patched_count, missing_indexes
+    return patched_count, missing_indexes
+
+
+def repair_request_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    stats: dict[str, Any] = {
+        "reasoning_patched_count": 0,
+        "reasoning_missing_indexes": [],
+        "tool_chain_fixed_count": 0,
+        "tool_chain_errors": [],
+    }
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        repaired_messages, fixed_count, errors = repair_tool_call_chain(messages)
+        payload["messages"] = repaired_messages
+        stats["tool_chain_fixed_count"] = fixed_count
+        stats["tool_chain_errors"] = errors
+
+    patched_count, missing_indexes = repair_reasoning_content(payload)
+    stats["reasoning_patched_count"] = patched_count
+    stats["reasoning_missing_indexes"] = missing_indexes
+
+    return payload, stats
 
 
 @app.get("/__health")
 async def health():
     return {
         "ok": True,
-        "version": "0.3.0",
         "default_base_url": DEFAULT_BASE_URL,
         "patch_mode": PATCH_MODE,
         "replay_miss_fallback": REPLAY_MISS_FALLBACK,
-        "normalize_developer_role": NORMALIZE_DEVELOPER_ROLE,
-        "normalize_content_blocks": NORMALIZE_CONTENT_BLOCKS,
-        "strip_unsupported_params": STRIP_UNSUPPORTED_PARAMS,
-        "force_model": FORCE_MODEL or None,
+        "tool_chain_fix_mode": TOOL_CHAIN_FIX_MODE,
+        "drop_orphan_tool_messages": DROP_ORPHAN_TOOL_MESSAGES,
         "allowed_base_hosts": ALLOWED_BASE_HOSTS,
         "cache": store.stats(),
     }
@@ -546,7 +584,7 @@ def build_upstream_url(request: Request, base_url: str) -> str:
     # 避免 base_url=https://api.deepseek.com/v1 且 path=/v1/chat/completions
     # 最终拼成 https://api.deepseek.com/v1/v1/chat/completions
     if base_url.endswith("/v1") and path.startswith("/v1/"):
-        path = path[len("/v1"):]
+        path = path[len("/v1") :]
 
     upstream_url = base_url + path
 
@@ -556,42 +594,62 @@ def build_upstream_url(request: Request, base_url: str) -> str:
     return upstream_url
 
 
-async def prepare_body(request: Request) -> tuple[bytes, int, list[int], dict[str, Any] | None, JSONResponse | None]:
+async def prepare_body(
+    request: Request,
+) -> tuple[bytes, dict[str, Any], dict[str, Any] | None, JSONResponse | None]:
     raw_body = await request.body()
-    patched_count = 0
-    missing_indexes: list[int] = []
+    stats: dict[str, Any] = {
+        "reasoning_patched_count": 0,
+        "reasoning_missing_indexes": [],
+        "tool_chain_fixed_count": 0,
+        "tool_chain_errors": [],
+    }
     payload: dict[str, Any] | None = None
 
     if not raw_body or not is_json_request(request):
-        return raw_body, patched_count, missing_indexes, payload, None
+        return raw_body, stats, payload, None
 
     if not request.url.path.endswith("/chat/completions"):
-        return raw_body, patched_count, missing_indexes, payload, None
+        return raw_body, stats, payload, None
 
     try:
         decoded = raw_body.decode("utf-8")
         loaded = json.loads(decoded)
     except Exception:
-        return raw_body, patched_count, missing_indexes, payload, None
+        return raw_body, stats, payload, None
 
     if not isinstance(loaded, dict):
-        return raw_body, patched_count, missing_indexes, payload, None
+        return raw_body, stats, payload, None
 
     payload = loaded
-    payload, patched_count, missing_indexes = repair_request_payload(payload)
+    payload, stats = repair_request_payload(payload)
 
-    if PATCH_MODE == "replay" and REPLAY_MISS_FALLBACK == "error" and missing_indexes:
-        return raw_body, patched_count, missing_indexes, payload, JSONResponse(
+    if TOOL_CHAIN_FIX_MODE == "error" and stats["tool_chain_errors"]:
+        return raw_body, stats, payload, JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_tool_call_chain",
+                "message": "assistant tool_calls must be immediately followed by tool messages for every tool_call_id.",
+                "details": stats["tool_chain_errors"],
+            },
+        )
+
+    if (
+        PATCH_MODE == "replay"
+        and REPLAY_MISS_FALLBACK == "error"
+        and stats["reasoning_missing_indexes"]
+    ):
+        return raw_body, stats, payload, JSONResponse(
             status_code=422,
             content={
                 "error": "missing_reasoning_content_cache",
                 "message": "assistant tool-call messages are missing reasoning_content, and no cached reasoning_content matched.",
-                "missing_message_indexes": missing_indexes,
+                "missing_message_indexes": stats["reasoning_missing_indexes"],
             },
         )
 
     new_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return new_body, patched_count, missing_indexes, payload, None
+    return new_body, stats, payload, None
 
 
 def build_request_headers(request: Request) -> dict[str, str]:
@@ -671,14 +729,14 @@ class SSEReasoningAccumulator:
             return None, data
 
         pos, delim = min(delimiters, key=lambda item: item[0])
-        return data[:pos], data[pos + len(delim):]
+        return data[:pos], data[pos + len(delim) :]
 
     def _handle_event(self, event: bytes) -> None:
         data_lines: list[bytes] = []
         for line in event.splitlines():
             stripped = line.strip()
             if stripped.startswith(b"data:"):
-                data_lines.append(stripped[len(b"data:"):].strip())
+                data_lines.append(stripped[len(b"data:") :].strip())
 
         if not data_lines:
             return
@@ -727,7 +785,11 @@ class SSEReasoningAccumulator:
 
                     current = state.tool_calls.setdefault(
                         tc_index,
-                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
                     )
 
                     tc_id = tc.get("id")
@@ -740,7 +802,9 @@ class SSEReasoningAccumulator:
 
                     function = tc.get("function")
                     if isinstance(function, dict):
-                        current_function = current.setdefault("function", {"name": "", "arguments": ""})
+                        current_function = current.setdefault(
+                            "function", {"name": "", "arguments": ""}
+                        )
                         name_piece = function.get("name")
                         if isinstance(name_piece, str):
                             current_function["name"] += name_piece
@@ -761,11 +825,15 @@ class SSEReasoningAccumulator:
                 "reasoning_content": state.reasoning_content,
                 "tool_calls": tool_calls,
             }
+            ensure_tool_call_ids(message)
             stored += store_assistant_message(message, source="stream")
         return stored
 
 
-async def stream_and_store_response(response: httpx.Response, client: httpx.AsyncClient) -> AsyncIterator[bytes]:
+async def stream_and_store_response(
+    response: httpx.Response,
+    client: httpx.AsyncClient,
+) -> AsyncIterator[bytes]:
     accumulator = SSEReasoningAccumulator()
 
     try:
@@ -808,7 +876,7 @@ async def proxy(request: Request, path: str):
 
     upstream_url = build_upstream_url(request, base_url)
     headers = build_request_headers(request)
-    body, patched_count, missing_indexes, request_payload, early_error = await prepare_body(request)
+    body, repair_stats, request_payload, early_error = await prepare_body(request)
 
     if early_error is not None:
         return early_error
@@ -817,13 +885,16 @@ async def proxy(request: Request, path: str):
     wants_stream = request_wants_stream(request_payload)
 
     logger.info(
-        "%s %s -> %s | patch_mode=%s patched=%s missing=%s stream=%s",
+        "%s %s -> %s | patch_mode=%s tool_chain_mode=%s reasoning_patched=%s "
+        "reasoning_missing=%s tool_fixed=%s stream=%s",
         request.method,
         request.url.path,
         upstream_url,
         PATCH_MODE,
-        patched_count,
-        missing_indexes,
+        TOOL_CHAIN_FIX_MODE,
+        repair_stats.get("reasoning_patched_count"),
+        repair_stats.get("reasoning_missing_indexes"),
+        repair_stats.get("tool_chain_fixed_count"),
         wants_stream,
     )
 
